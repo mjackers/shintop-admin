@@ -14,7 +14,7 @@ app=Flask(__name__,static_folder=str(ROOT/"static"))
 app.secret_key=os.environ['SESSION_SECRET']
 if len(app.secret_key)<40:raise RuntimeError('SESSION_SECRET must have at least 40 characters')
 password_hash=os.environ['ADMIN_PASSWORD_HASH']
-origin=os.environ['ADMIN_ORIGIN'].rstrip('/')
+origin=os.environ['ADMIN_ORIGIN'].strip().rstrip('/')
 if not origin.startswith('https://'):raise RuntimeError('ADMIN_ORIGIN must use HTTPS')
 app.config.update(MAX_CONTENT_LENGTH=8*1024*1024,SESSION_COOKIE_SECURE=True,SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Strict',PERMANENT_SESSION_LIFETIME=timedelta(minutes=30))
 s3=boto3.client('s3',endpoint_url=os.environ['S3_ENDPOINT'],region_name=os.getenv('S3_REGION','ru-1'),aws_access_key_id=os.environ['S3_ACCESS_KEY'],aws_secret_access_key=os.environ['S3_SECRET_KEY'],config=Config(signature_version='s3v4',connect_timeout=10,read_timeout=45,retries={'max_attempts':2},s3={'addressing_style':'path'}))
@@ -62,7 +62,7 @@ def validate(data):
 def secure(response):
  response.headers['Cache-Control']='no-store'
  response.headers['X-Content-Type-Options']='nosniff'
- response.headers['Referrer-Policy']='no-referrer'
+ response.headers['Referrer-Policy']='same-origin'
  response.headers['Content-Security-Policy']="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
  return response
 @app.errorhandler(413)
@@ -75,7 +75,10 @@ def login():
  if request.method=='POST':
   now=time.time();failures=[t for t in failures if now-t<900]
   if len(failures)>=10:return 'Слишком много попыток. Повторите через 15 минут.',429
-  if request.headers.get('Origin')!=origin or not secrets.compare_digest(request.form.get('csrf',''),session.get('csrf','!')):return 'CSRF',403
+  if request.headers.get('Origin')!=origin:
+   return 'Адрес панели не совпадает с ADMIN_ORIGIN. Проверьте переменную: только HTTPS-домен без /login. Затем заново откройте /login.',403
+  if not session.get('csrf') or not secrets.compare_digest(request.form.get('csrf',''),session.get('csrf','!')):
+   return 'Сессия входа устарела или cookies недоступны. Заново откройте /login. Если повторяется, проверьте постоянство SESSION_SECRET и число экземпляров приложения.',403
   if check_password_hash(password_hash,request.form.get('password','')):
    session.clear();session['authenticated']=True;session.permanent=True;token();return redirect('/')
   failures.append(now)
