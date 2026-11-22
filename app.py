@@ -8,6 +8,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from flask import Flask,request,session,jsonify,redirect,send_from_directory,render_template_string
 from werkzeug.security import check_password_hash
+from backup_crypto import encrypt_backup
 ROOT=Path(__file__).resolve().parent
 app=Flask(__name__,static_folder=str(ROOT/"static"))
 app.secret_key=os.environ['SESSION_SECRET']
@@ -18,7 +19,10 @@ if not origin.startswith('https://'):raise RuntimeError('ADMIN_ORIGIN must use H
 app.config.update(MAX_CONTENT_LENGTH=8*1024*1024,SESSION_COOKIE_SECURE=True,SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Strict',PERMANENT_SESSION_LIFETIME=timedelta(minutes=30))
 s3=boto3.client('s3',endpoint_url=os.environ['S3_ENDPOINT'],region_name=os.getenv('S3_REGION','ru-1'),aws_access_key_id=os.environ['S3_ACCESS_KEY'],aws_secret_access_key=os.environ['S3_SECRET_KEY'],config=Config(signature_version='s3v4',connect_timeout=10,read_timeout=45,retries={'max_attempts':2},s3={'addressing_style':'path'}))
 bucket=os.environ['S3_BUCKET'];key=os.getenv('CATALOG_KEY','products.json')
-backup_prefix=os.environ['BACKUP_PREFIX'].strip('/')+'/'
+backup_prefix=os.getenv('BACKUP_PREFIX','encrypted-catalog-backups').strip('/')+'/'
+backup_key=os.environ['BACKUP_ENCRYPTION_KEY']
+# Validate encryption configuration before serving any requests.
+encrypt_backup(b'configuration-check',backup_key)
 if backup_prefix==key or key.startswith(backup_prefix):raise RuntimeError('Backup prefix overlaps catalog')
 # A single worker is required for process-local rate limits and publish lock.
 failures=[];publish_lock=threading.Lock()
@@ -106,9 +110,10 @@ def publish():
   oldby={p['id']:p for p in old}
   for p in data:
    if p['id'] in oldby and {k:v for k,v in p.items() if k not in allowed}!={k:v for k,v in oldby[p['id']].items() if k not in allowed}:return jsonify(error='Изменены характеристики существующего товара. Повторите импорт.'),400
-  backup=backup_prefix+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')+'-'+secrets.token_hex(6)+'.json'
-  # Fail closed if private backup creation fails. Never use public-read ACL.
-  s3.put_object(Bucket=bucket,Key=backup,Body=raw,ContentType='application/json',CacheControl='no-store',ACL='private')
+  backup=backup_prefix+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')+'-'+secrets.token_hex(6)+'.json.enc'
+  # Encrypt locally BEFORE storage. Public bucket policy may expose ciphertext, never raw catalog.
+  encrypted=encrypt_backup(raw,backup_key)
+  s3.put_object(Bucket=bucket,Key=backup,Body=encrypted,ContentType='application/octet-stream',CacheControl='no-store')
   encoded=json.dumps(data,ensure_ascii=False,allow_nan=False).encode()
   # Conditional write prevents overwriting concurrent updates; provider must support IfMatch.
   result=s3.put_object(Bucket=bucket,Key=key,Body=encoded,ContentType='application/json; charset=utf-8',CacheControl='no-cache,max-age=0,must-revalidate',IfMatch=etag)
