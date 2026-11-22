@@ -124,6 +124,18 @@ def publish():
  except ClientError as e:
   code=e.response.get('Error',{}).get('Code','')
   app.logger.exception('S3 publication failed')
+  if code in ('PreconditionFailed','412'):
+   try:
+    latest_raw,latest_data,latest_etag=read_catalog()
+    same_body=hashlib.sha256(latest_raw).digest()==hashlib.sha256(raw).digest()
+    same_etag=latest_etag==etag
+    app.logger.warning('S3_PRECONDITION_DIAG unchanged_body=%s unchanged_etag=%s request_id=%s',same_body,same_etag,e.response.get('ResponseMetadata',{}).get('RequestId','unknown'))
+    if same_body and same_etag:
+     return jsonify(error='S3 отклонил IfMatch, хотя повторное чтение показывает тот же каталог и ETag. Запись не подтверждена. Код S3-412-UNCHANGED: требуется проверка условной записи на стороне хранилища. Повторное нажатие не исправит проблему.'),409
+    return jsonify(error='После чтения каталога изменились его данные или ETag. Код S3-412-CHANGED. Обновите страницу и повторно проверьте Excel перед публикацией.'),409
+   except Exception:
+    app.logger.exception('S3 precondition diagnostic read failed')
+    return jsonify(error='S3 отказал в условной записи, повторное чтение не удалось. Код S3-412-READ-FAILED. Публикация не подтверждена; обратитесь к логам приложения.'),503
   return jsonify(error='Конфликт версии. Обновите каталог.' if code in ('PreconditionFailed','412') else 'S3 отклонил запись. Проверьте права, приватность резервных копий и поддержку условной записи. Публикация не подтверждена.'),409 if code in ('PreconditionFailed','412') else 503
  except Exception:app.logger.exception('Publication failed');return jsonify(error='Публикация не подтверждена. Проверьте каталог перед повторной попыткой.'),503
  finally:publish_lock.release()
