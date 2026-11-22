@@ -9,6 +9,7 @@ from botocore.exceptions import ClientError
 from flask import Flask,request,session,jsonify,redirect,send_from_directory,render_template_string
 from werkzeug.security import check_password_hash
 from backup_crypto import encrypt_backup
+from s3_compat import choose_mode,condition
 ROOT=Path(__file__).resolve().parent
 app=Flask(__name__,static_folder=str(ROOT/"static"))
 app.secret_key=os.environ['SESSION_SECRET']
@@ -17,7 +18,7 @@ password_hash=os.environ['ADMIN_PASSWORD_HASH']
 origin=os.environ['ADMIN_ORIGIN'].strip().rstrip('/')
 if not origin.startswith('https://'):raise RuntimeError('ADMIN_ORIGIN must use HTTPS')
 app.config.update(MAX_CONTENT_LENGTH=8*1024*1024,SESSION_COOKIE_SECURE=True,SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Strict',PERMANENT_SESSION_LIFETIME=timedelta(minutes=30))
-s3=boto3.client('s3',endpoint_url=os.environ['S3_ENDPOINT'],region_name=os.getenv('S3_REGION','ru-1'),aws_access_key_id=os.environ['S3_ACCESS_KEY'],aws_secret_access_key=os.environ['S3_SECRET_KEY'],config=Config(signature_version='s3v4',connect_timeout=10,read_timeout=45,retries={'max_attempts':2},s3={'addressing_style':'path'}))
+s3=boto3.client('s3',endpoint_url=os.environ['S3_ENDPOINT'],region_name=os.getenv('S3_REGION','ru-1'),aws_access_key_id=os.environ['S3_ACCESS_KEY'],aws_secret_access_key=os.environ['S3_SECRET_KEY'],config=Config(request_checksum_calculation='when_required',response_checksum_validation='when_required',signature_version='s3v4',connect_timeout=10,read_timeout=45,retries={'max_attempts':2},s3={'addressing_style':'path'}))
 bucket=os.environ['S3_BUCKET'];key=os.getenv('CATALOG_KEY','products.json')
 backup_prefix=os.getenv('BACKUP_PREFIX','encrypted-catalog-backups').strip('/')+'/'
 backup_key=os.environ['BACKUP_ENCRYPTION_KEY']
@@ -26,6 +27,7 @@ encrypt_backup(b'configuration-check',backup_key)
 if backup_prefix==key or key.startswith(backup_prefix):raise RuntimeError('Backup prefix overlaps catalog')
 # A single worker is required for process-local rate limits and publish lock.
 failures=[];publish_lock=threading.Lock()
+conditional_mode=None
 def token():
  if 'csrf' not in session:session['csrf']=secrets.token_urlsafe(32)
  return session['csrf']
@@ -98,6 +100,7 @@ def catalog():
 @app.post('/api/publish')
 @require_auth
 def publish():
+ global conditional_mode
  if not check_csrf():return jsonify(error='Проверка безопасности не пройдена. Обновите страницу.'),403
  body=request.get_json(silent=True) or {};data=body.get('products');version=body.get('version')
  try:validate(data)
@@ -113,14 +116,25 @@ def publish():
   oldby={p['id']:p for p in old}
   for p in data:
    if p['id'] in oldby and {k:v for k,v in p.items() if k not in allowed}!={k:v for k,v in oldby[p['id']].items() if k not in allowed}:return jsonify(error='Изменены характеристики существующего товара. Повторите импорт.'),400
+  if conditional_mode is None:
+   try:conditional_mode=choose_mode(s3,bucket,backup_prefix+'compatibility')
+   except Exception:
+    app.logger.exception('Conditional-write compatibility check failed')
+    return jsonify(error='Проверка безопасной записи S3 не пройдена. Рабочий каталог не записывался. Код S3-SAFE-WRITE-UNAVAILABLE. Нужен другой способ публикации; повторять кнопку не нужно.'),503
+  # The probe took time: re-read before backing up and committing.
+  current_raw,current_data,current_etag=read_catalog()
+  if current_etag!=etag or current_raw!=raw:return jsonify(error='Каталог изменился во время проверки. Обновите страницу и проверьте Excel заново.'),409
   backup=backup_prefix+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')+'-'+secrets.token_hex(6)+'.json.enc'
   # Encrypt locally BEFORE storage. Public bucket policy may expose ciphertext, never raw catalog.
   encrypted=encrypt_backup(raw,backup_key)
   s3.put_object(Bucket=bucket,Key=backup,Body=encrypted,ContentType='application/octet-stream',CacheControl='no-store')
   encoded=json.dumps(data,ensure_ascii=False,allow_nan=False).encode()
   # Conditional write prevents overwriting concurrent updates; provider must support IfMatch.
-  result=s3.put_object(Bucket=bucket,Key=key,Body=encoded,ContentType='application/json; charset=utf-8',CacheControl='no-cache,max-age=0,must-revalidate',IfMatch=etag)
-  return jsonify(products=data,version=result['ETag'],backup=backup)
+  result=s3.put_object(Bucket=bucket,Key=key,Body=encoded,ContentType='application/json; charset=utf-8',CacheControl='no-cache,max-age=0,must-revalidate',IfMatch=condition(etag,conditional_mode))
+  checked_raw,checked_data,checked_etag=read_catalog()
+  if checked_raw!=encoded:
+   return jsonify(error='S3 принял запись, но контрольное чтение отличается. Не повторяйте публикацию: сначала проверьте каталог и резервную копию.'),503
+  return jsonify(products=checked_data,version=checked_etag,backup=backup)
  except ClientError as e:
   code=e.response.get('Error',{}).get('Code','')
   app.logger.exception('S3 publication failed')
